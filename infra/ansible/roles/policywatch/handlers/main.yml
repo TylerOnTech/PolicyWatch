@@ -1,0 +1,12 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+# `compose up -d` is idempotent: it recreates only containers whose image or configuration changed,
+# so a deploy does not take down unchanged services (systemd restart would run `down` first).
+- name: Restart policywatch
+  ansible.builtin.command:
+    cmd: docker compose -f deploy/docker-compose.prod.yml --env-file {{ policywatch_root }}/.env up -d --remove-orphans
+    chdir: "{{ policywatch_root }}/current"
+  changed_when: true

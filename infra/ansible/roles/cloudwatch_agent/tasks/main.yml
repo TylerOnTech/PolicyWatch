@@ -1,0 +1,22 @@
+---
+# Host-level metrics (memory, disk, swap) that EC2 does not report natively. Application logs are
+# shipped by the Docker awslogs driver; application metrics come from log metric filters.
+- name: Install the CloudWatch agent
+  ansible.builtin.dnf:
+    name: amazon-cloudwatch-agent
+    state: present
+
+- name: Configure the CloudWatch agent
+  ansible.builtin.template:
+    src: amazon-cloudwatch-agent.json.j2
+    dest: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload cloudwatch agent
+
+- name: Enable and start the CloudWatch agent
+  ansible.builtin.systemd_service:
+    name: amazon-cloudwatch-agent
+    enabled: true
+    state: started

@@ -1,0 +1,38 @@
+---
+# Configures a fresh Amazon Linux 2023 host and deploys PolicyWatch. Idempotent: re-run to deploy
+# a new version or converge configuration drift.
+#
+#   ansible-playbook playbooks/site.yml
+#   ansible-playbook playbooks/site.yml --tags app        # redeploy application only
+- name: Configure and deploy PolicyWatch
+  hosts: all
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Verify the target is Amazon Linux 2023
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['distribution'] == 'Amazon'
+          - ansible_facts['distribution_major_version'] == '2023'
+        fail_msg: "These roles target Amazon Linux 2023 (found {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }})."
+      tags: [always]
+
+    - name: Verify required inventory variables
+      ansible.builtin.assert:
+        that:
+          - aws_region is defined
+          - ssm_parameter_prefix is defined and ssm_parameter_prefix is match('^/')
+          - cloudwatch_log_group is defined
+        fail_msg: "Set aws_region, ssm_parameter_prefix and cloudwatch_log_group (terraform output ansible_inventory)."
+      tags: [always]
+
+  roles:
+    - role: common
+      tags: [common]
+    - role: docker
+      tags: [docker]
+    - role: cloudwatch_agent
+      tags: [cloudwatch]
+    - role: policywatch
+      tags: [app]

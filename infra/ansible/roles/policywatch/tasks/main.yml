@@ -1,0 +1,177 @@
+---
+- name: Create application directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+  loop:
+    - "{{ policywatch_root }}"
+    - "{{ policywatch_root }}/releases"
+
+# ------------------------------------------------------------------------------------ release bundle
+- name: Package the source tree on the control machine
+  delegate_to: localhost
+  become: false
+  run_once: true
+  ansible.builtin.command:
+    argv:
+      - tar
+      - --exclude=./node_modules
+      - --exclude=./.tools
+      - --exclude=./.git
+      - --exclude=./dist
+      - --exclude=./coverage
+      - --exclude=./.env
+      - --exclude=./infra/terraform/.terraform
+      - --exclude=./infra/terraform/terraform.tfstate*
+      - -czf
+      - "/tmp/policywatch-{{ policywatch_version }}.tgz"
+      - -C
+      - "{{ policywatch_source_dir }}"
+      - .
+  changed_when: true
+
+- name: Create release directory
+  ansible.builtin.file:
+    path: "{{ policywatch_root }}/releases/{{ policywatch_version }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Unpack release
+  ansible.builtin.unarchive:
+    src: "/tmp/policywatch-{{ policywatch_version }}.tgz"
+    dest: "{{ policywatch_root }}/releases/{{ policywatch_version }}"
+    owner: root
+    group: root
+
+# --------------------------------------------------------------------------------- secrets from SSM
+- name: Read application secrets from SSM Parameter Store (instance role, on the host)
+  ansible.builtin.command:
+    argv:
+      - aws
+      - ssm
+      - get-parameters-by-path
+      - --region
+      - "{{ aws_region }}"
+      - --path
+      - "{{ ssm_parameter_prefix }}"
+      - --with-decryption
+      - --query
+      - "Parameters[].{name: Name, value: Value}"
+      - --output
+      - json
+  register: ssm_result
+  changed_when: false
+  no_log: true
+
+- name: Index secrets by name
+  ansible.builtin.set_fact:
+    policywatch_secrets: "{{ dict(ssm_parameters | map(attribute='name') | map('basename') | zip(ssm_parameters | map(attribute='value'))) }}"
+  vars:
+    ssm_parameters: "{{ ssm_result.stdout | from_json }}"
+  no_log: true
+
+- name: Verify all required secrets exist
+  ansible.builtin.assert:
+    that: "policywatch_required_secrets | difference(policywatch_secrets.keys() | list) | length == 0"
+    fail_msg: >-
+      Missing SSM parameters under {{ ssm_parameter_prefix }}:
+      {{ policywatch_required_secrets | difference(policywatch_secrets.keys() | list) | join(', ') }}.
+      Run infra/scripts/put-secrets.sh first.
+    quiet: true
+
+- name: Render runtime environment (secrets; root-only)
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ policywatch_root }}/.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart policywatch
+
+# ----------------------------------------------------------------------------------- activate release
+- name: Point "current" at the new release
+  ansible.builtin.file:
+    src: "{{ policywatch_root }}/releases/{{ policywatch_version }}"
+    dest: "{{ policywatch_root }}/current"
+    state: link
+    force: true
+  register: current_link
+  notify: Restart policywatch
+
+- name: Build images for this release
+  ansible.builtin.command:
+    cmd: docker compose -f deploy/docker-compose.prod.yml --env-file {{ policywatch_root }}/.env build
+    chdir: "{{ policywatch_root }}/current"
+  register: build_result
+  changed_when: "'Built' in build_result.stderr or 'Built' in build_result.stdout"
+
+- name: Install systemd unit
+  ansible.builtin.template:
+    src: policywatch.service.j2
+    dest: /etc/systemd/system/policywatch.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart policywatch
+
+- name: Enable PolicyWatch at boot
+  ansible.builtin.systemd_service:
+    name: policywatch
+    enabled: true
+    daemon_reload: true
+
+- name: Apply pending restarts before health checks
+  ansible.builtin.meta: flush_handlers
+
+- name: Ensure the stack is up
+  ansible.builtin.systemd_service:
+    name: policywatch
+    state: started
+
+# ------------------------------------------------------------------------------------- verification
+# Asked from inside the API container, so the check is independent of Caddy/TLS and the public SG.
+- name: Wait for the API to report healthy (database, Redis and at least one worker)
+  ansible.builtin.command:
+    cmd: >-
+      docker compose -f deploy/docker-compose.prod.yml --env-file {{ policywatch_root }}/.env
+      exec -T api node -e "fetch('http://127.0.0.1:3000/health').then(r => r.json())
+      .then(h => { console.log(JSON.stringify(h)); process.exit(h.status === 'ok' ? 0 : 1); })
+      .catch(() => process.exit(1))"
+    chdir: "{{ policywatch_root }}/current"
+  register: health
+  until: health.rc == 0
+  retries: 40
+  delay: 5
+  changed_when: false
+
+- name: Show health summary
+  ansible.builtin.debug:
+    msg: "PolicyWatch {{ policywatch_version }}: {{ (health.stdout | from_json).status }}, workers={{ (health.stdout | from_json).checks.workers.count }}"
+
+# ---------------------------------------------------------------------------------------- clean-up
+- name: Find old releases
+  ansible.builtin.find:
+    paths: "{{ policywatch_root }}/releases"
+    file_type: directory
+  register: releases
+
+- name: Remove releases beyond the retention count
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ (releases.files | sort(attribute='mtime', reverse=true))[policywatch_releases_to_keep:] }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+- name: Prune dangling images
+  ansible.builtin.command: docker image prune -f
+  register: prune
+  changed_when: "'Total reclaimed space: 0B' not in prune.stdout"

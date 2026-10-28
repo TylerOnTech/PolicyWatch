@@ -1,0 +1,161 @@
+# Local development / demo stack. Usage:
+#   cp .env.example .env
+#   docker compose up -d --build                     # postgres, redis, migrate, api, worker, simulators
+#   docker compose run --rm seed                     # enroll the synthetic portfolio (optional)
+#   docker compose run --rm demo                     # the three-minute walkthrough
+#
+# Published ports bind to 127.0.0.1 only. PostgreSQL and Redis are exposed on localhost purely for
+# local inspection; the production compose file (deploy/) publishes neither.
+
+name: policywatch
+
+x-app: &app
+  image: policywatch:local
+  build:
+    context: .
+    target: runtime
+  restart: unless-stopped
+  env_file: .env
+  stop_grace_period: 30s
+  environment: &app-env
+    NODE_ENV: production
+    DATABASE_URL: postgresql://policywatch:${POSTGRES_PASSWORD:?Copy .env.example to .env}@postgres:5432/policywatch?schema=public
+    REDIS_URL: redis://redis:6379
+    CARRIER_SIM_BASE_URL: http://carrier-sim:4000
+    # Local only: lets webhooks reach the bundled mock receiver over HTTP on the Docker network.
+    WEBHOOK_ALLOWED_HOSTS: mock-receiver
+    WEBHOOK_REQUIRE_HTTPS: "false"
+
+x-tools: &tools
+  image: policywatch-tools:local
+  build:
+    context: .
+    target: tools
+  env_file: .env
+  restart: "no"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: policywatch
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Copy .env.example to .env}
+      POSTGRES_DB: policywatch
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U policywatch -d policywatch"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    # AOF persistence: delayed retry jobs survive a Redis restart. noeviction: BullMQ must never lose keys.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    <<: *tools
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://policywatch:${POSTGRES_PASSWORD}@postgres:5432/policywatch?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  carrier-sim:
+    <<: *app
+    command: ["node", "dist/entrypoints/carrier-sim.js"]
+    ports:
+      - "127.0.0.1:4000:4000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  mock-receiver:
+    <<: *app
+    command: ["node", "dist/entrypoints/mock-receiver.js"]
+    ports:
+      - "127.0.0.1:4100:4100"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4100/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  api:
+    <<: *app
+    command: ["node", "dist/entrypoints/api.js"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    <<: *app
+    command: ["node", "dist/entrypoints/worker.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      carrier-sim:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  seed:
+    <<: *tools
+    profiles: ["tools"]
+    command: ["npx", "tsx", "scripts/seed.ts"]
+    environment:
+      <<: *app-env
+      NODE_ENV: development
+    depends_on:
+      api:
+        condition: service_healthy
+
+  demo:
+    <<: *tools
+    profiles: ["tools"]
+    command: ["npx", "tsx", "scripts/demo.ts"]
+    environment:
+      API_URL: http://api:3000
+      CARRIER_SIM_URL: http://carrier-sim:4000
+      RECEIVER_URL: http://mock-receiver:4100
+      RECEIVER_WEBHOOK_URL: http://mock-receiver:4100/webhooks
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:

@@ -1,0 +1,19 @@
+# Managed by Ansible
+[Unit]
+Description=PolicyWatch (Docker Compose stack)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{ policywatch_root }}/current
+Environment=APP_VERSION={{ policywatch_version }}
+ExecStart=/usr/bin/docker compose -f deploy/docker-compose.prod.yml --env-file {{ policywatch_root }}/.env up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f deploy/docker-compose.prod.yml --env-file {{ policywatch_root }}/.env down
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

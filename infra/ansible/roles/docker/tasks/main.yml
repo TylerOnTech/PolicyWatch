@@ -1,0 +1,45 @@
+---
+- name: Install Docker Engine (Amazon Linux 2023 repository)
+  ansible.builtin.dnf:
+    name: docker
+    state: present
+
+- name: Configure Docker daemon
+  ansible.builtin.template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart docker
+
+- name: Create Docker CLI plugin directory
+  ansible.builtin.file:
+    path: /usr/local/lib/docker/cli-plugins
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install Docker Compose v2 plugin (checksum-verified)
+  ansible.builtin.get_url:
+    url: "https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-linux-{{ docker_compose_arch }}"
+    checksum: "sha256:https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-linux-{{ docker_compose_arch }}.sha256"
+    dest: /usr/local/lib/docker/cli-plugins/docker-compose
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Enable and start Docker
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Flush handlers so Docker runs with the final daemon configuration
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify Docker Compose is available
+  ansible.builtin.command: docker compose version
+  register: compose_version
+  changed_when: false

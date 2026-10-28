@@ -1,0 +1,6 @@
+#!/bin/bash
+# Minimal bootstrap: everything else is configured by Ansible (idempotent, re-runnable).
+set -euo pipefail
+hostnamectl set-hostname "${hostname}"
+systemctl enable --now amazon-ssm-agent || true
+echo "policywatch bootstrap complete $(date -u +%FT%TZ)" > /var/log/policywatch-bootstrap.log

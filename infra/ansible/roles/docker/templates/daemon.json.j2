@@ -1,0 +1,13 @@
+{
+  "live-restore": true,
+  "log-driver": "awslogs",
+  "log-opts": {
+    "awslogs-region": "{{ aws_region }}",
+    "awslogs-group": "{{ cloudwatch_log_group }}",
+    "tag": "{{ '{{' }}.Name{{ '}}' }}",
+    "mode": "non-blocking",
+    "max-buffer-size": "4m"
+  },
+  "no-new-privileges": true,
+  "userland-proxy": false
+}

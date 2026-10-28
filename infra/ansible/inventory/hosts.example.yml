@@ -1,0 +1,10 @@
+# Copy to hosts.yml (gitignored). `terraform output -raw ansible_inventory` prints this with real values.
+all:
+  hosts:
+    policywatch:
+      ansible_host: 203.0.113.10
+      ansible_user: ec2-user
+      aws_region: us-east-1
+      ssm_parameter_prefix: /policywatch/demo
+      cloudwatch_log_group: /policywatch/demo/app
+      site_address: ":80"

@@ -1,0 +1,28 @@
+---
+# Application layout on the host
+policywatch_root: /opt/policywatch
+policywatch_releases_to_keep: 3
+# Release identifier: the current git commit, or a timestamp when not in a git checkout.
+policywatch_version: "{{ lookup('ansible.builtin.pipe', 'git -C ' ~ (playbook_dir ~ '/../../..') ~ ' rev-parse --short HEAD 2>/dev/null || date -u +%Y%m%d%H%M%S') }}"
+policywatch_source_dir: "{{ playbook_dir }}/../../.."
+
+# Secrets are read on the host from SSM Parameter Store with the instance role (never via this machine).
+policywatch_required_secrets:
+  - ADMIN_API_KEY
+  - READONLY_API_KEY
+  - SECRET_ENCRYPTION_KEY
+  - POSTGRES_PASSWORD
+  - REDIS_PASSWORD
+
+# Non-secret runtime configuration (rendered into /opt/policywatch/.env)
+policywatch_log_level: info
+policywatch_default_check_interval_seconds: 3600
+policywatch_webhook_max_attempts: 8
+policywatch_webhook_backoff_base_ms: 30000
+# The demo deployment targets the bundled receiver; set to "" before using real subscriber endpoints.
+policywatch_webhook_allowed_hosts: mock-receiver
+
+# Host configuration
+swap_size_mb: 1024
+docker_compose_version: v2.29.7
+docker_compose_arch: "{{ 'aarch64' if ansible_facts['architecture'] in ['aarch64', 'arm64'] else 'x86_64' }}"

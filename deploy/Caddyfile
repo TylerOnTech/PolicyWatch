@@ -1,0 +1,16 @@
+# SITE_ADDRESS=":80" serves plain HTTP (IP-only demo). Set it to a DNS name pointing at the Elastic IP
+# (e.g. "policywatch.example.com") and Caddy obtains and renews a Let's Encrypt certificate itself.
+{$SITE_ADDRESS}
+
+encode gzip
+
+header {
+	-Server
+	Strict-Transport-Security "max-age=31536000"
+	X-Content-Type-Options "nosniff"
+}
+
+# Only the public API is proxied. The worker, simulators, PostgreSQL and Redis are not reachable.
+reverse_proxy api:3000 {
+	header_up X-Request-Id {http.request.header.X-Request-Id}
+}

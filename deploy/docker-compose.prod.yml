@@ -1,0 +1,157 @@
+# Production-style stack for the single-EC2 deployment. Rendered environment and secrets come from
+# /opt/policywatch/.env, which Ansible writes from SSM Parameter Store (mode 0600, root-owned).
+#
+# Exposure: only Caddy publishes ports (80/443). PostgreSQL, Redis, the worker and the simulators are
+# reachable solely on the internal Docker network. Every container logs to CloudWatch via awslogs.
+
+name: policywatch
+
+x-logging: &logging
+  driver: awslogs
+  options:
+    awslogs-region: ${AWS_REGION:?AWS_REGION missing from .env}
+    awslogs-group: ${CLOUDWATCH_LOG_GROUP:?CLOUDWATCH_LOG_GROUP missing from .env}
+    tag: "{{.Name}}"
+
+x-app: &app
+  image: policywatch:${APP_VERSION:-latest}
+  build:
+    context: ..
+    target: runtime
+  restart: unless-stopped
+  env_file: /opt/policywatch/.env
+  logging: *logging
+  stop_grace_period: 30s
+  read_only: true
+  tmpfs: ["/tmp"]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  environment: &app-env
+    NODE_ENV: production
+    DATABASE_URL: postgresql://policywatch:${POSTGRES_PASSWORD:?}@postgres:5432/policywatch?schema=public
+    REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379
+    CARRIER_SIM_BASE_URL: http://carrier-sim:4000
+    TRUST_PROXY: "true"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: policywatch
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: policywatch
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U policywatch -d policywatch"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    logging: *logging
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction", "--requirepass", "${REDIS_PASSWORD:?}"]
+    volumes:
+      - redisdata:/data
+    mem_limit: 192m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+
+  migrate:
+    image: policywatch-tools:${APP_VERSION:-latest}
+    build:
+      context: ..
+      target: tools
+    restart: "no"
+    logging: *logging
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://policywatch:${POSTGRES_PASSWORD:?}@postgres:5432/policywatch?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    command: ["node", "dist/entrypoints/api.js"]
+    mem_limit: 320m
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    <<: *app
+    command: ["node", "dist/entrypoints/worker.js"]
+    mem_limit: 320m
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+
+  # Synthetic carriers and a reference receiver for the portfolio demo. Internal network only.
+  carrier-sim:
+    <<: *app
+    command: ["node", "dist/entrypoints/carrier-sim.js"]
+    mem_limit: 128m
+
+  mock-receiver:
+    <<: *app
+    command: ["node", "dist/entrypoints/mock-receiver.js"]
+    mem_limit: 128m
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+    mem_limit: 64m
+    depends_on:
+      api:
+        condition: service_healthy
+
+  demo:
+    image: policywatch-tools:${APP_VERSION:-latest}
+    profiles: ["tools"]
+    restart: "no"
+    env_file: /opt/policywatch/.env
+    command: ["npx", "tsx", "scripts/demo.ts"]
+    environment:
+      API_URL: http://api:3000
+      CARRIER_SIM_URL: http://carrier-sim:4000
+      RECEIVER_URL: http://mock-receiver:4100
+      RECEIVER_WEBHOOK_URL: http://mock-receiver:4100/webhooks
+
+volumes:
+  pgdata:
+  redisdata:
+  caddydata:

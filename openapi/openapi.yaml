@@ -1,0 +1,906 @@
+openapi: 3.1.0
+info:
+  title: PolicyWatch API
+  version: 1.0.0
+  summary: Event-driven insurance policy monitoring with signed webhook delivery.
+  description: |
+    PolicyWatch polls (synthetic) insurance carrier APIs, normalizes responses into the
+    **NormalizedPolicy v1** contract, detects semantic changes, and delivers signed webhooks with
+    at-least-once semantics.
+
+    ## Authentication
+    Every endpoint except `/health`, `/health/live`, `/openapi.json` and `/docs` requires a bearer
+    API key: `Authorization: Bearer <key>`.
+
+    | Key | Configured by | Allowed |
+    |---|---|---|
+    | Admin | `ADMIN_API_KEY` | all operations |
+    | Read-only (optional) | `READONLY_API_KEY` | `GET` operations only |
+
+    Missing/invalid key → `401 UNAUTHENTICATED`; read-only key on a write → `403 FORBIDDEN`.
+
+    ## Errors
+    All errors share one envelope: `{ "error": { "code", "message", "details?", "requestId" } }`.
+    `requestId` equals the `X-Request-Id` response header and appears in every log line for the request.
+
+    ## Pagination
+    List endpoints use opaque keyset cursors: pass `pagination.nextCursor` back as `cursor`.
+    `nextCursor` is `null` on the last page. Results are newest first.
+
+    ## Correlation
+    Send `X-Request-Id` (8–128 chars of `[A-Za-z0-9._:-]`) to correlate your request with PolicyWatch
+    logs, the resulting policy check, its events and their webhook deliveries.
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:3000
+    description: Local Docker Compose
+security:
+  - bearerAuth: []
+tags:
+  - name: System
+  - name: Policies
+  - name: Events
+  - name: Subscriptions
+  - name: Deliveries
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: System health (readiness)
+      description: |
+        Probes PostgreSQL and Redis and reports live workers (from their Redis heartbeats).
+        Returns **503** only when the database or Redis is down. No workers, or a worker whose
+        background loops keep failing, yields `status: degraded` with HTTP 200.
+      security: []
+      responses:
+        '200':
+          description: Healthy or degraded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Database or Redis unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+  /health/live:
+    get:
+      tags: [System]
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: Process is serving HTTP
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { status: { type: string, const: ok } }
+  /metrics:
+    get:
+      tags: [System]
+      summary: Prometheus metrics (API process)
+      responses:
+        '200':
+          description: Prometheus text exposition format
+          content:
+            text/plain: { schema: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /policies:
+    get:
+      tags: [Policies]
+      summary: List monitored policies
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: carrierId
+          in: query
+          schema: { type: string, examples: [acme] }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/PolicyStatus' }
+      responses:
+        '200':
+          description: A page of policies
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Policy' } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+    post:
+      tags: [Policies]
+      summary: Enroll a carrier policy for monitoring
+      description: |
+        Creates the monitored-policy record and queues its baseline retrieval. The first
+        successful check stores version 1 and emits **no** events (there is nothing to compare with).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EnrollPolicyRequest' }
+            example: { carrierId: acme, externalPolicyId: ACM-AUTO-100234, checkIntervalSeconds: 3600 }
+      responses:
+        '201':
+          description: Enrolled
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Already enrolled (`details.policyId` holds the existing ID)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /policies/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PolicyId'
+    get:
+      tags: [Policies]
+      summary: Get a policy with its current normalized snapshot
+      responses:
+        '200':
+          description: Policy
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Policy'
+                  - type: object
+                    properties:
+                      current:
+                        oneOf:
+                          - $ref: '#/components/schemas/NormalizedPolicy'
+                          - type: 'null'
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Policies]
+      summary: Change monitoring settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                checkIntervalSeconds: { type: integer, minimum: 60, maximum: 604800 }
+                monitoringEnabled: { type: boolean }
+      responses:
+        '200':
+          description: Updated policy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Policy' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /policies/{id}/history:
+    parameters:
+      - $ref: '#/components/parameters/PolicyId'
+    get:
+      tags: [Policies]
+      summary: Versioned snapshot history with the events each version produced
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: includeData
+          in: query
+          description: Include the full NormalizedPolicy for each version (default true).
+          schema: { type: string, enum: ['true', 'false'] }
+      responses:
+        '200':
+          description: Snapshots, newest version first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Snapshot' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /policies/{id}/checks:
+    parameters:
+      - $ref: '#/components/parameters/PolicyId'
+    get:
+      tags: [Policies]
+      summary: Monitoring check audit log (successes and failures)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Checks, newest first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Check' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /policies/{id}/check:
+    parameters:
+      - $ref: '#/components/parameters/PolicyId'
+    post:
+      tags: [Policies]
+      summary: Trigger an immediate policy check
+      description: |
+        Queues a manual check. With `wait=true` the request blocks (up to `timeoutMs`) until the
+        worker finishes and returns the check record and any events it generated.
+      parameters:
+        - name: wait
+          in: query
+          schema: { type: string, enum: ['true', 'false'] }
+        - name: timeoutMs
+          in: query
+          schema: { type: integer, minimum: 100, maximum: 30000, default: 15000 }
+      responses:
+        '200':
+          description: Check completed (wait=true)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: completed }
+                  check: { $ref: '#/components/schemas/Check' }
+                  events: { type: array, items: { $ref: '#/components/schemas/Event' } }
+        '202':
+          description: Check queued (or still running when the wait timed out)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: queued }
+                  jobId: { type: string }
+                  policyId: { type: string }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /events:
+    get:
+      tags: [Events]
+      summary: List domain events
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - { name: policyId, in: query, schema: { type: string } }
+        - { name: carrierId, in: query, schema: { type: string } }
+        - { name: eventType, in: query, schema: { $ref: '#/components/schemas/EventType' } }
+        - { name: since, in: query, description: 'ISO-8601 date-time (inclusive, on occurredAt)', schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: Events, newest first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Event' } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /events/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, pattern: '^evt_' } }
+    get:
+      tags: [Events]
+      summary: Get an event and a summary of its deliveries
+      responses:
+        '200':
+          description: Event
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Event'
+                  - type: object
+                    properties:
+                      deliveries:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string }
+                            subscriptionId: { type: string }
+                            status: { $ref: '#/components/schemas/DeliveryStatus' }
+                            attemptCount: { type: integer }
+                            succeededAt: { type: [string, 'null'], format: date-time }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /subscriptions:
+    post:
+      tags: [Subscriptions]
+      summary: Create a webhook subscription
+      description: |
+        The response contains the signing `secret` — **the only time it is returned**. Store it
+        securely; it is kept encrypted (AES-256-GCM) at rest. URLs are checked against SSRF rules:
+        https only (unless development allowlisted), no credentials, no private/loopback/link-local/
+        metadata destinations (checked again at every delivery, at connect time).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSubscriptionRequest' }
+            example:
+              url: https://hooks.example.com/policywatch
+              eventTypes: [POLICY_CANCELLED, POLICY_EXPIRED]
+              carrierIds: []
+              description: Retention team alerts
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Subscription'
+                  - type: object
+                    required: [secret]
+                    properties:
+                      secret: { type: string, examples: [whsec_3q2-sYnTh3t1c-3xAmpl3] }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      tags: [Subscriptions]
+      summary: List subscriptions (excludes deleted unless status=DELETED)
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - { name: status, in: query, schema: { type: string, enum: [ACTIVE, INACTIVE, DELETED] } }
+      responses:
+        '200':
+          description: Subscriptions
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Subscription' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /subscriptions/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, pattern: '^sub_' } }
+    get:
+      tags: [Subscriptions]
+      summary: Get a subscription
+      responses:
+        '200':
+          description: Subscription
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Subscriptions]
+      summary: Update, activate or deactivate a subscription
+      description: Deactivating cancels the subscription's pending and scheduled deliveries.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                active: { type: boolean }
+                url: { type: string, format: uri, maxLength: 2048 }
+                eventTypes: { type: array, minItems: 1, items: { $ref: '#/components/schemas/EventTypeOrWildcard' } }
+                carrierIds: { type: array, items: { type: string } }
+                description: { type: [string, 'null'], maxLength: 500 }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Subscription is deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Subscriptions]
+      summary: Delete a subscription (soft delete; delivery history is retained)
+      responses:
+        '204': { description: Deleted }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /deliveries:
+    get:
+      tags: [Deliveries]
+      summary: List webhook deliveries
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - { name: subscriptionId, in: query, schema: { type: string } }
+        - { name: eventId, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/DeliveryStatus' } }
+      responses:
+        '200':
+          description: Deliveries, newest first
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      data: { type: array, items: { $ref: '#/components/schemas/Delivery' } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /deliveries/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, pattern: '^dlv_' } }
+    get:
+      tags: [Deliveries]
+      summary: Get a delivery with its full attempt audit trail
+      responses:
+        '200':
+          description: Delivery
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Delivery'
+                  - type: object
+                    properties:
+                      attempts: { type: array, items: { $ref: '#/components/schemas/DeliveryAttempt' } }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /deliveries/{id}/retry:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, pattern: '^dlv_' } }
+    post:
+      tags: [Deliveries]
+      summary: Manually redeliver
+      description: |
+        Re-sends the same event (same `eventId`, byte-identical body, fresh timestamp/signature) with a
+        new attempt budget. Allowed for `SUCCEEDED`, `FAILED`, `CANCELLED` and `RETRY_SCHEDULED`
+        deliveries whose subscription is active.
+      responses:
+        '202':
+          description: Redelivery queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Delivery' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Already in flight (`DELIVERY_IN_FLIGHT`) or subscription inactive (`SUBSCRIPTION_INACTIVE`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /openapi.json:
+    get:
+      tags: [System]
+      summary: This document as JSON
+      security: []
+      responses:
+        '200': { description: OpenAPI document }
+
+webhooks:
+  policyEvent:
+    post:
+      summary: Policy event notification
+      description: |
+        Sent to each active subscription whose filters match. Verify `PolicyWatch-Signature` over the
+        raw body, reject timestamps more than 300 s old, and de-duplicate on `eventId`. Respond 2xx
+        within 5 s. See docs/webhooks.md.
+      parameters:
+        - { name: PolicyWatch-Signature, in: header, required: true, schema: { type: string, examples: ['v1=5257a869e7ec…'] } }
+        - { name: PolicyWatch-Timestamp, in: header, required: true, schema: { type: string, examples: ['1793145600'] } }
+        - { name: PolicyWatch-Event-Id, in: header, required: true, schema: { type: string } }
+        - { name: PolicyWatch-Event-Type, in: header, required: true, schema: { $ref: '#/components/schemas/EventType' } }
+        - { name: PolicyWatch-Delivery-Id, in: header, required: true, schema: { type: string } }
+        - { name: PolicyWatch-Attempt, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookPayload' }
+      responses:
+        '200': { description: Accepted (any 2xx) }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Admin or read-only API key from the server's environment.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from `pagination.nextCursor`.
+      schema: { type: string }
+    PolicyId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, pattern: '^pol_[0-9a-z]{26}$' }
+
+  responses:
+    ValidationError:
+      description: Invalid request (`VALIDATION_ERROR`, `INVALID_JSON`, `INVALID_CURSOR`, `INVALID_WEBHOOK_URL`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: Request validation failed
+              details: [{ path: limit, message: 'Too big: expected number to be <=100' }]
+              requestId: 0d4c1c7e-0b7a-4c43-9c5e-2a1f3c9b8e10
+    Unauthenticated:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: The read-only key cannot perform write operations
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
+            requestId: { type: string }
+
+    PageEnvelope:
+      type: object
+      required: [data, pagination]
+      properties:
+        data: { type: array, items: {} }
+        pagination:
+          type: object
+          properties:
+            limit: { type: integer }
+            nextCursor: { type: [string, 'null'] }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded, down] }
+        version: { type: string }
+        uptimeSeconds: { type: integer }
+        checks:
+          type: object
+          properties:
+            database: { $ref: '#/components/schemas/ComponentHealth' }
+            redis: { $ref: '#/components/schemas/ComponentHealth' }
+            workers:
+              type: object
+              properties:
+                status: { type: string, enum: [up, degraded, none] }
+                count: { type: integer }
+                instances: { type: array, items: { type: object } }
+    ComponentHealth:
+      type: object
+      properties:
+        status: { type: string, enum: [up, down] }
+        latencyMs: { type: integer }
+        error: { type: string }
+
+    PolicyStatus: { type: string, enum: [ACTIVE, PENDING, CANCELLED, EXPIRED] }
+    EventType:
+      type: string
+      enum: [POLICY_CANCELLED, POLICY_REINSTATED, POLICY_RENEWED, POLICY_EXPIRED, COVERAGE_CHANGED, PREMIUM_CHANGED, VEHICLE_ADDED, VEHICLE_REMOVED]
+    EventTypeOrWildcard:
+      oneOf:
+        - $ref: '#/components/schemas/EventType'
+        - { type: string, const: '*', description: All event types }
+    CheckOutcome: { type: string, enum: [BASELINE, CHANGED, UNCHANGED, STALE_DISCARDED, FAILED] }
+    FailureCategory:
+      type: string
+      enum: [CARRIER_TIMEOUT, CARRIER_UNAVAILABLE, CARRIER_RATE_LIMITED, CARRIER_AUTH_FAILED, CARRIER_REQUEST_REJECTED, CARRIER_DATA_UNAVAILABLE, POLICY_NOT_FOUND, INVALID_CARRIER_RESPONSE, INTERNAL_ERROR]
+    DeliveryStatus: { type: string, enum: [PENDING, IN_PROGRESS, RETRY_SCHEDULED, SUCCEEDED, FAILED, CANCELLED] }
+
+    Money:
+      type: object
+      required: [amountCents, currency]
+      properties:
+        amountCents: { type: integer, minimum: 0 }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+
+    EnrollPolicyRequest:
+      type: object
+      additionalProperties: false
+      required: [carrierId, externalPolicyId]
+      properties:
+        carrierId: { type: string, enum: [acme, bluebird, cardinal] }
+        externalPolicyId: { type: string, maxLength: 64, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$' }
+        checkIntervalSeconds: { type: integer, minimum: 60, maximum: 604800, description: 'Lower bound is MIN_CHECK_INTERVAL_SECONDS (default 60).' }
+        monitoringEnabled: { type: boolean, default: true }
+
+    Policy:
+      type: object
+      properties:
+        id: { type: string, examples: [pol_01jbx3k9v6m8q2r4t7w9y0z1a2] }
+        carrierId: { type: string }
+        externalPolicyId: { type: string }
+        status: { oneOf: [{ $ref: '#/components/schemas/PolicyStatus' }, { type: 'null' }] }
+        policyType: { type: [string, 'null'] }
+        effectiveDate: { type: [string, 'null'], format: date }
+        expirationDate: { type: [string, 'null'], format: date }
+        premium: { oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }] }
+        currentVersion: { type: integer, description: '0 until the baseline check succeeds' }
+        monitoring:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            checkIntervalSeconds: { type: integer }
+            nextCheckAt: { type: string, format: date-time }
+            lastCheckedAt: { type: [string, 'null'], format: date-time }
+            lastSuccessfulCheckAt: { type: [string, 'null'], format: date-time }
+            lastCheckOutcome: { oneOf: [{ $ref: '#/components/schemas/CheckOutcome' }, { type: 'null' }] }
+            lastFailureCategory: { oneOf: [{ $ref: '#/components/schemas/FailureCategory' }, { type: 'null' }] }
+            consecutiveFailures: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    NormalizedPolicy:
+      description: NormalizedPolicy v1. Full contract and normalization rules in docs/normalized-policy-v1.md.
+      type: object
+      required: [schemaVersion, carrierId, externalPolicyId, policyholder, policyType, status, effectiveDate, expirationDate, premium, coverages, vehicles, drivers, retrievedAt]
+      additionalProperties: false
+      properties:
+        schemaVersion: { type: string, const: '1.0' }
+        carrierId: { type: string }
+        externalPolicyId: { type: string }
+        policyholder:
+          type: object
+          properties:
+            firstName: { type: string }
+            lastName: { type: string }
+            email: { type: [string, 'null'], format: email }
+            phone: { type: [string, 'null'], description: E.164 }
+            address:
+              type: object
+              properties:
+                line1: { type: string }
+                line2: { type: [string, 'null'] }
+                city: { type: string }
+                state: { type: string, pattern: '^[A-Z]{2}$' }
+                postalCode: { type: string, pattern: '^\d{5}(-\d{4})?$' }
+                country: { type: string, pattern: '^[A-Z]{2}$' }
+        policyType: { type: string, enum: [AUTO, HOME, RENTERS, UMBRELLA] }
+        status: { $ref: '#/components/schemas/PolicyStatus' }
+        effectiveDate: { type: string, format: date }
+        expirationDate: { type: string, format: date }
+        premium: { $ref: '#/components/schemas/Money' }
+        coverages:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+                enum: [BODILY_INJURY_LIABILITY, PROPERTY_DAMAGE_LIABILITY, UNINSURED_MOTORIST_BI, UNDERINSURED_MOTORIST_BI, MEDICAL_PAYMENTS, PERSONAL_INJURY_PROTECTION, COLLISION, COMPREHENSIVE, RENTAL_REIMBURSEMENT, ROADSIDE_ASSISTANCE, OTHER]
+              carrierCode: { type: string }
+              vehicleVin: { type: [string, 'null'] }
+              limitPerPersonCents: { type: [integer, 'null'] }
+              limitPerOccurrenceCents: { type: [integer, 'null'] }
+              deductibleCents: { type: [integer, 'null'] }
+        vehicles:
+          type: array
+          items:
+            type: object
+            properties:
+              vin: { type: string, pattern: '^[A-HJ-NPR-Z0-9]{17}$' }
+              year: { type: integer }
+              make: { type: string }
+              model: { type: string }
+        drivers:
+          type: array
+          items:
+            type: object
+            properties:
+              firstName: { type: string }
+              lastName: { type: string }
+              dateOfBirth: { type: [string, 'null'], format: date }
+              licenseState: { type: [string, 'null'] }
+              relationship: { type: [string, 'null'], enum: [NAMED_INSURED, SPOUSE, CHILD, OTHER, null] }
+        retrievedAt: { type: string, format: date-time }
+
+    Snapshot:
+      type: object
+      properties:
+        id: { type: string }
+        version: { type: integer }
+        contentHash: { type: string, description: SHA-256 of the canonical JSON (excluding retrievedAt) }
+        retrievedAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        policy: { $ref: '#/components/schemas/NormalizedPolicy' }
+        events:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              eventType: { $ref: '#/components/schemas/EventType' }
+
+    Check:
+      type: object
+      properties:
+        id: { type: string }
+        policyId: { type: string }
+        trigger: { type: string, enum: [ENROLLMENT, SCHEDULED, MANUAL] }
+        outcome: { $ref: '#/components/schemas/CheckOutcome' }
+        failureCategory: { oneOf: [{ $ref: '#/components/schemas/FailureCategory' }, { type: 'null' }] }
+        errorMessage: { type: [string, 'null'] }
+        httpStatus: { type: [integer, 'null'] }
+        snapshotVersion: { type: [integer, 'null'] }
+        eventsGenerated: { type: integer }
+        durationMs: { type: integer }
+        correlationId: { type: [string, 'null'] }
+        startedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time }
+
+    Event:
+      type: object
+      properties:
+        id: { type: string }
+        eventType: { $ref: '#/components/schemas/EventType' }
+        schemaVersion: { type: string, const: '1.0' }
+        policyId: { type: string }
+        carrierId: { type: string }
+        externalPolicyId: { type: string }
+        policyVersion: { type: integer }
+        previousVersion: { type: integer }
+        occurredAt: { type: string, format: date-time, description: When PolicyWatch observed the change (retrievedAt of the revealing snapshot). }
+        createdAt: { type: string, format: date-time }
+        data: { type: object, description: Event-type-specific payload; see docs/webhooks.md }
+
+    WebhookPayload:
+      type: object
+      required: [eventId, eventType, schemaVersion, occurredAt, policyId, carrierId, externalPolicyId, policyVersion, previousVersion, data]
+      properties:
+        eventId: { type: string, description: Stable across retries — use it to deduplicate. }
+        eventType: { $ref: '#/components/schemas/EventType' }
+        schemaVersion: { type: string, const: '1.0' }
+        occurredAt: { type: string, format: date-time }
+        policyId: { type: string }
+        carrierId: { type: string }
+        externalPolicyId: { type: string }
+        policyVersion: { type: integer }
+        previousVersion: { type: integer }
+        data: { type: object }
+      example:
+        eventId: evt_01jbx3m2a4c6e8g0j2l4n6q8s0
+        eventType: POLICY_CANCELLED
+        schemaVersion: '1.0'
+        occurredAt: '2026-10-28T00:00:00.000Z'
+        policyId: pol_01jbx3k9v6m8q2r4t7w9y0z1a2
+        carrierId: acme
+        externalPolicyId: ACM-AUTO-100234
+        policyVersion: 2
+        previousVersion: 1
+        data:
+          previousStatus: ACTIVE
+          currentStatus: CANCELLED
+          term: { effectiveDate: '2026-05-01', expirationDate: '2026-11-01' }
+
+    CreateSubscriptionRequest:
+      type: object
+      additionalProperties: false
+      required: [url, eventTypes]
+      properties:
+        url: { type: string, format: uri, maxLength: 2048 }
+        eventTypes: { type: array, minItems: 1, items: { $ref: '#/components/schemas/EventTypeOrWildcard' } }
+        carrierIds: { type: array, items: { type: string }, default: [], description: Empty means all carriers. }
+        description: { type: [string, 'null'], maxLength: 500 }
+
+    Subscription:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string }
+        description: { type: [string, 'null'] }
+        eventTypes: { type: array, items: { type: string } }
+        carrierIds: { type: array, items: { type: string } }
+        status: { type: string, enum: [ACTIVE, INACTIVE, DELETED] }
+        secretHint: { type: string, description: Last four characters of the signing secret. }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Delivery:
+      type: object
+      properties:
+        id: { type: string }
+        subscriptionId: { type: string }
+        eventId: { type: string }
+        eventType: { $ref: '#/components/schemas/EventType' }
+        policyId: { type: string }
+        status: { $ref: '#/components/schemas/DeliveryStatus' }
+        attemptCount: { type: integer }
+        maxAttempts: { type: integer }
+        manualRetryCount: { type: integer }
+        nextAttemptAt: { type: [string, 'null'], format: date-time }
+        lastAttemptAt: { type: [string, 'null'], format: date-time }
+        lastResponseStatus: { type: [integer, 'null'] }
+        lastError: { type: [string, 'null'] }
+        succeededAt: { type: [string, 'null'], format: date-time }
+        failedAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    DeliveryAttempt:
+      type: object
+      properties:
+        id: { type: string }
+        attemptNumber: { type: integer }
+        trigger: { type: string, enum: [AUTOMATIC, MANUAL] }
+        outcome: { type: string, enum: [SUCCESS, HTTP_ERROR, TIMEOUT, NETWORK_ERROR, BLOCKED_DESTINATION] }
+        destinationHost: { type: string }
+        responseStatus: { type: [integer, 'null'] }
+        responseBodySnippet: { type: [string, 'null'], description: First 512 bytes of the receiver's response. }
+        errorMessage: { type: [string, 'null'] }
+        signatureTimestamp: { type: integer }
+        durationMs: { type: integer }
+        startedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time }
