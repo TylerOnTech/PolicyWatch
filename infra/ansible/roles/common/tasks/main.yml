@@ -64,16 +64,16 @@
 - name: Check for swap file
   ansible.builtin.stat:
     path: /swapfile
-  register: swapfile
+  register: common_swapfile
 
 - name: Create swap file (small instances need headroom during image builds)
   ansible.builtin.command:
     cmd: "dd if=/dev/zero of=/swapfile bs=1M count={{ swap_size_mb }}"
     creates: /swapfile
-  when: not swapfile.stat.exists
+  when: not common_swapfile.stat.exists
 
 - name: Secure and format swap file
-  when: not swapfile.stat.exists
+  when: not common_swapfile.stat.exists
   block:
     - name: Restrict swap file permissions
       ansible.builtin.file:

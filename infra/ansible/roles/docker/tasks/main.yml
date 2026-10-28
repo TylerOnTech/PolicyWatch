@@ -41,5 +41,5 @@
 
 - name: Verify Docker Compose is available
   ansible.builtin.command: docker compose version
-  register: compose_version
+  register: docker_compose_check
   changed_when: false

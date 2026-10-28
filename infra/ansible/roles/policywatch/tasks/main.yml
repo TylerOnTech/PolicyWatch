@@ -64,7 +64,7 @@
       - "Parameters[].{name: Name, value: Value}"
       - --output
       - json
-  register: ssm_result
+  register: policywatch_ssm_result
   changed_when: false
   no_log: true
 
@@ -72,7 +72,7 @@
   ansible.builtin.set_fact:
     policywatch_secrets: "{{ dict(ssm_parameters | map(attribute='name') | map('basename') | zip(ssm_parameters | map(attribute='value'))) }}"
   vars:
-    ssm_parameters: "{{ ssm_result.stdout | from_json }}"
+    ssm_parameters: "{{ policywatch_ssm_result.stdout | from_json }}"
   no_log: true
 
 - name: Verify all required secrets exist
@@ -101,15 +101,14 @@
     dest: "{{ policywatch_root }}/current"
     state: link
     force: true
-  register: current_link
   notify: Restart policywatch
 
 - name: Build images for this release
   ansible.builtin.command:
     cmd: docker compose -f deploy/docker-compose.prod.yml --env-file {{ policywatch_root }}/.env build
     chdir: "{{ policywatch_root }}/current"
-  register: build_result
-  changed_when: "'Built' in build_result.stderr or 'Built' in build_result.stdout"
+  register: policywatch_build
+  changed_when: "'Built' in policywatch_build.stderr or 'Built' in policywatch_build.stdout"
 
 - name: Install systemd unit
   ansible.builtin.template:
@@ -146,32 +145,34 @@
       .then(h => { console.log(JSON.stringify(h)); process.exit(h.status === 'ok' ? 0 : 1); })
       .catch(() => process.exit(1))"
     chdir: "{{ policywatch_root }}/current"
-  register: health
-  until: health.rc == 0
+  register: policywatch_health
+  until: policywatch_health.rc == 0
   retries: 40
   delay: 5
   changed_when: false
 
 - name: Show health summary
   ansible.builtin.debug:
-    msg: "PolicyWatch {{ policywatch_version }}: {{ (health.stdout | from_json).status }}, workers={{ (health.stdout | from_json).checks.workers.count }}"
+    msg: "PolicyWatch {{ policywatch_version }}: {{ policywatch_health_report.status }}, workers={{ policywatch_health_report.checks.workers.count }}"
+  vars:
+    policywatch_health_report: "{{ policywatch_health.stdout | from_json }}"
 
 # ---------------------------------------------------------------------------------------- clean-up
 - name: Find old releases
   ansible.builtin.find:
     paths: "{{ policywatch_root }}/releases"
     file_type: directory
-  register: releases
+  register: policywatch_releases
 
 - name: Remove releases beyond the retention count
   ansible.builtin.file:
     path: "{{ item.path }}"
     state: absent
-  loop: "{{ (releases.files | sort(attribute='mtime', reverse=true))[policywatch_releases_to_keep:] }}"
+  loop: "{{ (policywatch_releases.files | sort(attribute='mtime', reverse=true))[policywatch_releases_to_keep:] }}"
   loop_control:
     label: "{{ item.path | basename }}"
 
 - name: Prune dangling images
   ansible.builtin.command: docker image prune -f
-  register: prune
-  changed_when: "'Total reclaimed space: 0B' not in prune.stdout"
+  register: policywatch_prune
+  changed_when: "'Total reclaimed space: 0B' not in policywatch_prune.stdout"
